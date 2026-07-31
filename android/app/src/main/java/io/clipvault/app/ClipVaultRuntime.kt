@@ -152,11 +152,12 @@ object ClipVaultRuntime {
     private var statusMessage = "等待配对"
     private var advancedAdbStatus = "未启用"
     private var defaultPairingId = ""
+    
     @Volatile
     private var autoReconnectScheduled = false
     private var localAddress = "0.0.0.0"
-    
-    // 核心修复：添加 @Volatile 保证多线程对防回音标志位的内存可见性
+
+    // 保持内存可见性，防止并发下的死循环
     @Volatile
     private var lastClipboardSignature = ""
     @Volatile
@@ -605,7 +606,6 @@ object ClipVaultRuntime {
             statusMessage = "已自动连接 ${remembered.serverName}"
             notifyState()
         } catch (exception: Exception) {
-            Log.d("ClipVaultRuntime", "auto reconnect skipped reason=$reason target=${remembered.serverId} error=${exception.message}")
             serviceStatus = if (peers.isEmpty()) "offline" else "online"
             statusMessage = "未连接到上次设备，等待对方打开 ClipVault"
             notifyState()
@@ -782,6 +782,8 @@ object ClipVaultRuntime {
 
     private fun persistState() {
         try {
+            // 核心修复：防止 ConcurrentModificationException 闪退，先把 history 拷贝一份快照再循环写入
+            val historySnapshot = synchronized(this) { history.toList() }
             storeFile.writeText(
                 JSONObject().apply {
                     put(
@@ -813,7 +815,7 @@ object ClipVaultRuntime {
                     put(
                         "history",
                         JSONArray().apply {
-                            history.forEach { put(it.toJson()) }
+                            historySnapshot.forEach { put(it.toJson()) }
                         },
                     )
                     put(
@@ -961,7 +963,6 @@ object ClipVaultRuntime {
         )
     }
 
-    // 核心修复方法：将剪贴板写入强行切回 Android 主线程，避免后台线程直接操作 ClipboardManager 抛出异常崩溃
     private fun applyClipboardEntry(entry: HistoryEntry) {
         Handler(Looper.getMainLooper()).post {
             try {
@@ -999,24 +1000,30 @@ object ClipVaultRuntime {
             put("routeId", routeId)
             put("entry", entry.toJson())
         }
-        var sentCount = 0
-        peers.values.forEach { peer ->
-            if (peer.device.id != originPeerId) {
-                try {
-                    writeFrame(peer.output, payload)
-                    sentCount += 1
-                } catch (_: Exception) {
-                    disconnectPeer(peer.device.id)
+        
+        // 核心终极修复：把 Socket 网络发送包裹在 executor 中
+        // 防止剪贴板监听器在主线程中触发网络 I/O 导致被系统直接斩杀（NetworkOnMainThreadException）
+        executor.execute {
+            var sentCount = 0
+            peers.values.forEach { peer ->
+                if (peer.device.id != originPeerId) {
+                    try {
+                        writeFrame(peer.output, payload)
+                        sentCount += 1
+                    } catch (e: Exception) {
+                        Log.e("ClipVaultRuntime", "发送给设备失败，关闭连接", e)
+                        disconnectPeer(peer.device.id)
+                    }
                 }
             }
+            Log.d("ClipVaultRuntime", "broadcast clipboard route=$routeId peers=${peers.size} sent=$sentCount")
         }
-        Log.d("ClipVaultRuntime", "broadcast clipboard route=$routeId peers=${peers.size} sent=$sentCount preview=${entry.preview}")
+        
         serviceStatus = "online"
         statusMessage = if (peers.isEmpty()) "本地历史已更新" else "已同步到已连接设备"
         notifyState()
     }
 
-    // 核心修复方法：为 Socket 读取循环提供异常日志捕获，帮助追踪异常断开
     private fun readSocketLoop(peer: SocketPeer) {
         executor.execute {
             try {
@@ -1060,6 +1067,8 @@ object ClipVaultRuntime {
                 }
                 peers[peer.device.id] = peer
                 message.optJSONObject("pairingPayload")?.let { rememberPairing(it, peer.device) }
+                
+                // 将回复过程也保护在后台线程，实际上这里已经在 executor 中了，安全
                 writeFrame(
                     peer.output,
                     JSONObject().apply {
