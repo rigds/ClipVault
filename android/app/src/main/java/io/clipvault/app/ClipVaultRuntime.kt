@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
@@ -153,8 +155,13 @@ object ClipVaultRuntime {
     @Volatile
     private var autoReconnectScheduled = false
     private var localAddress = "0.0.0.0"
+    
+    // 核心修复：添加 @Volatile 保证多线程对防回音标志位的内存可见性
+    @Volatile
     private var lastClipboardSignature = ""
+    @Volatile
     private var suppressedClipboardSignature = ""
+
     private val serverIdentity = ServerIdentity()
     private val notes = listOf(
         "安卓端使用前台服务保持长连接。",
@@ -954,27 +961,34 @@ object ClipVaultRuntime {
         )
     }
 
+    // 核心修复方法：将剪贴板写入强行切回 Android 主线程，避免后台线程直接操作 ClipboardManager 抛出异常崩溃
     private fun applyClipboardEntry(entry: HistoryEntry) {
-        if (entry.mimeType == "text/plain" && !entry.text.isNullOrBlank()) {
-            clipboardManager.setPrimaryClip(ClipData.newPlainText("ClipVault", entry.text))
-            suppressedClipboardSignature = "text/plain:${entry.sha256}"
-            lastClipboardSignature = suppressedClipboardSignature
-            return
-        }
+        Handler(Looper.getMainLooper()).post {
+            try {
+                if (entry.mimeType == "text/plain" && !entry.text.isNullOrBlank()) {
+                    suppressedClipboardSignature = "text/plain:${entry.sha256}"
+                    lastClipboardSignature = suppressedClipboardSignature
+                    clipboardManager.setPrimaryClip(ClipData.newPlainText("ClipVault", entry.text))
+                    return@post
+                }
 
-        if (entry.mimeType == "image/png" && !entry.imageBase64.isNullOrBlank()) {
-            val bytes = android.util.Base64.decode(entry.imageBase64, android.util.Base64.DEFAULT)
-            val imageFile = File(appContext.cacheDir, "clipvault-images/${entry.sha256}.png")
-            imageFile.parentFile?.mkdirs()
-            imageFile.writeBytes(bytes)
-            val uri = FileProvider.getUriForFile(
-                appContext,
-                "${appContext.packageName}.fileprovider",
-                imageFile,
-            )
-            clipboardManager.setPrimaryClip(ClipData.newUri(appContext.contentResolver, "ClipVault Image", uri))
-            suppressedClipboardSignature = "image/png:${entry.sha256}"
-            lastClipboardSignature = suppressedClipboardSignature
+                if (entry.mimeType == "image/png" && !entry.imageBase64.isNullOrBlank()) {
+                    val bytes = android.util.Base64.decode(entry.imageBase64, android.util.Base64.DEFAULT)
+                    val imageFile = File(appContext.cacheDir, "clipvault-images/${entry.sha256}.png")
+                    imageFile.parentFile?.mkdirs()
+                    imageFile.writeBytes(bytes)
+                    val uri = FileProvider.getUriForFile(
+                        appContext,
+                        "${appContext.packageName}.fileprovider",
+                        imageFile,
+                    )
+                    suppressedClipboardSignature = "image/png:${entry.sha256}"
+                    lastClipboardSignature = suppressedClipboardSignature
+                    clipboardManager.setPrimaryClip(ClipData.newUri(appContext.contentResolver, "ClipVault Image", uri))
+                }
+            } catch (e: Exception) {
+                Log.e("ClipVaultRuntime", "写入剪贴板操作失败", e)
+            }
         }
     }
 
@@ -1002,6 +1016,7 @@ object ClipVaultRuntime {
         notifyState()
     }
 
+    // 核心修复方法：为 Socket 读取循环提供异常日志捕获，帮助追踪异常断开
     private fun readSocketLoop(peer: SocketPeer) {
         executor.execute {
             try {
@@ -1012,7 +1027,8 @@ object ClipVaultRuntime {
                     val message = JSONObject(String(buffer, Charsets.UTF_8))
                     handleSocketMessage(peer, message)
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e("ClipVaultRuntime", "Socket 接收循环异常断开 peerId=${peer.device.id}", e)
                 disconnectPeer(peer.device.id)
                 scheduleAutoReconnect("peer-closed")
             }
