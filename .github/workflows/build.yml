@@ -17,7 +17,7 @@ jobs:
       uses: actions/setup-java@v4
       with:
         distribution: 'zulu'
-        java-version: '17'
+        java-version: '21' # 这里已经为你改成了必需的 Java 21 版本
 
     - name: Set up Node.js
       uses: actions/setup-node@v4
